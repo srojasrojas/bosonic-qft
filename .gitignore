@@ -1,0 +1,9 @@
+# Virtual environments
+fourierenv/
+venv/
+
+# Python cache files
+__pycache__/
+
+# VS Code settings
+.vscode/settings.json
