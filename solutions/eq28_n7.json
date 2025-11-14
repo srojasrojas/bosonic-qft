@@ -1,0 +1,71 @@
+{
+  "method": "Differential Evolution (Multi-Eq27)",
+  "lambda_full": [
+    2.3454086264320435,
+    -0.9623302891058522,
+    -2.9545409735522403,
+    0.7064565877010524,
+    0.7064565877010524,
+    -2.9545409735522403,
+    -0.9623302891058522
+  ],
+  "objective_value": 1.5736973131008988e-16,
+  "success": true,
+  "iterations": 177,
+  "solve_time": 436.1557528972626,
+  "verification": {
+    "is_valid": true,
+    "max_residual": 4.514089102514163e-09,
+    "mean_residual": 1.094354325979791e-09,
+    "tolerance": 1e-08,
+    "pairs_checked": 49,
+    "sample_ratio": 0.1
+  },
+  "N": 7,
+  "equation": 28,
+  "use_symmetry": true,
+  "monte_carlo_ratio": 0.1,
+  "tolerance": 1e-08,
+  "eq27_file": ".\\solutions\\eq27_n7.json",
+  "eq27_solutions_used": 10,
+  "standard_qft_lambda": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "standard_qft_verification": {
+    "is_valid": true,
+    "max_residual": 3.708144902248023e-14,
+    "mean_residual": 6.3169424339896664e-15,
+    "tolerance": 1e-08,
+    "pairs_checked": 49,
+    "sample_ratio": 0.1
+  },
+  "total_eq27_attempts": 10,
+  "all_eq27_objectives": [
+    4.0345653737682335e-16,
+    3.2205422646397157e-14,
+    4.603850473836814e-16,
+    5.132219318918677e-15,
+    1.2874592870484982e-14,
+    1.5736973131008988e-16,
+    2.2416020162803994e-15,
+    4.1654522940574304e-14,
+    2.6728876991897806e-15,
+    2.4622080930590493e-14
+  ],
+  "best_eq27_index": 5,
+  "eq27_source_lambda": [
+    6.28189991750702,
+    4.4867041154557095,
+    5.384302016481365,
+    2.691508313404399,
+    2.691508313404399,
+    5.384302016481365,
+    4.4867041154557095
+  ]
+}

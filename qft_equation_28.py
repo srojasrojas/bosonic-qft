@@ -247,22 +247,70 @@ class QFTEquation28Solver:
             disp=True,
             seed=42,
             atol=1e-12,
-            tol=1e-12
+            tol=1e-12,
+            polish=False  # We'll do custom polishing
         )
         
-        solve_time = time.time() - start_time
-        lambda_full = self.expand_lambda_vector(result.x)
+        # Try rational pi approximation before final polishing
+        print("Attempting rational π approximation...")
+        rational_result = self._try_rational_pi_approximation(result.x, max_denominator=20, tolerance=1e-6)
         
-        return {
+        if rational_result is not None and rational_result['num_approximated'] > 0:
+            print(f"  ✓ Found {rational_result['num_approximated']} rational π approximations")
+            print(f"  Original objective: {rational_result['original_objective']:.2e}")
+            print(f"  Approximated objective: {rational_result['approximated_objective']:.2e}")
+            
+            for approx in rational_result['approximations']:
+                if approx['form'] != "numerical":
+                    print(f"    λ_{approx['index']} ≈ {approx['form']} (error: {approx['error']:.2e})")
+            
+            polish_start = rational_result['lambda_params']
+        else:
+            print("  No beneficial rational approximations found, using DE result")
+            polish_start = result.x
+        
+        # Final polishing with L-BFGS-B
+        print("Polishing solution with 'L-BFGS-B'")
+        polish_result = minimize(
+            fun=self.objective_function,
+            x0=polish_start,
+            method='L-BFGS-B',
+            bounds=bounds,
+            options={'ftol': 1e-12, 'gtol': 1e-12}
+        )
+        
+        print(f"  Objective: {polish_result.fun:.2e}, Success: {polish_result.success}")
+        
+        if polish_result.fun < result.fun:
+            final_x = polish_result.x
+            final_obj = polish_result.fun
+            final_success = polish_result.success
+            print(f"  ★ Polishing improved solution!")
+        else:
+            final_x = result.x
+            final_obj = result.fun
+            final_success = result.success
+        
+        solve_time = time.time() - start_time
+        lambda_full = self.expand_lambda_vector(final_x)
+        
+        result_dict = {
             'method': 'Differential Evolution',
-            'lambda_params': result.x,
+            'lambda_params': final_x,
             'lambda_full': lambda_full,
-            'objective_value': result.fun,
-            'success': result.success,
+            'objective_value': final_obj,
+            'success': final_success,
             'iterations': result.nit,
             'solve_time': solve_time,
             'message': result.message
         }
+        
+        if rational_result is not None and rational_result['num_approximated'] > 0:
+            result_dict['rational_approximation_attempted'] = True
+            result_dict['rational_approximations'] = rational_result['approximations']
+            result_dict['num_rational_approximations'] = rational_result['num_approximated']
+        
+        return result_dict
     
     def solve_basin_hopping(self, initial_guess: Optional[np.ndarray] = None,
                            n_basins: int = 100, 
@@ -529,6 +577,112 @@ class QFTEquation28Solver:
         
         return valid_solutions
     
+    def _try_rational_pi_approximation(self, lambda_params: np.ndarray, 
+                                       max_denominator: int = 20,
+                                       tolerance: float = 1e-6) -> Optional[Dict]:
+        """
+        Try to approximate lambda parameters as rational multiples of pi or sqrt(rational)*pi.
+        
+        This attempts to find closed-form expressions like λ = (p/q)π or λ = √(p/q)π
+        where p, q are small integers (< max_denominator).
+        
+        Args:
+            lambda_params: Current parameter vector
+            max_denominator: Maximum denominator for rational approximation
+            tolerance: How close the approximation must be to original value
+            
+        Returns:
+            Dictionary with approximated parameters and metadata, or None if no improvement
+        """
+        from fractions import Fraction
+        import math
+        
+        lambda_full = self.expand_lambda_vector(lambda_params)
+        approx_lambda_full = lambda_full.copy()
+        approximations = []
+        
+        for i, lam in enumerate(lambda_full):
+            best_approx = lam
+            best_form = "numerical"
+            best_error = float('inf')
+            
+            # Try rational multiples of pi: (p/q)*pi
+            ratio = lam / np.pi
+            try:
+                frac = Fraction(ratio).limit_denominator(max_denominator)
+                if abs(frac.numerator) < max_denominator and frac.denominator < max_denominator:
+                    approx_val = float(frac) * np.pi
+                    error = abs(approx_val - lam)
+                    if error < tolerance and error < best_error:
+                        best_approx = approx_val
+                        best_form = f"{frac.numerator}/{frac.denominator}*π"
+                        best_error = error
+            except (ValueError, ZeroDivisionError):
+                pass
+            
+            # Try sqrt(rational) * pi: sqrt(p/q)*pi
+            ratio_sq = (lam / np.pi) ** 2
+            if ratio_sq > 0:  # Only for positive values
+                try:
+                    frac = Fraction(ratio_sq).limit_denominator(max_denominator)
+                    if abs(frac.numerator) < max_denominator and frac.denominator < max_denominator:
+                        approx_val = math.sqrt(float(frac)) * np.pi
+                        error = abs(approx_val - lam)
+                        if error < tolerance and error < best_error:
+                            best_approx = approx_val
+                            best_form = f"√({frac.numerator}/{frac.denominator})*π"
+                            best_error = error
+                except (ValueError, ZeroDivisionError):
+                    pass
+            
+            # Try negative sqrt(rational) * pi: -sqrt(p/q)*pi
+            ratio_sq_neg = (lam / np.pi) ** 2
+            if ratio_sq_neg > 0 and lam < 0:
+                try:
+                    frac = Fraction(ratio_sq_neg).limit_denominator(max_denominator)
+                    if abs(frac.numerator) < max_denominator and frac.denominator < max_denominator:
+                        approx_val = -math.sqrt(float(frac)) * np.pi
+                        error = abs(approx_val - lam)
+                        if error < tolerance and error < best_error:
+                            best_approx = approx_val
+                            best_form = f"-√({frac.numerator}/{frac.denominator})*π"
+                            best_error = error
+                except (ValueError, ZeroDivisionError):
+                    pass
+            
+            approx_lambda_full[i] = best_approx
+            approximations.append({
+                'index': i,
+                'original': float(lam),
+                'approximated': float(best_approx),
+                'form': best_form,
+                'error': float(best_error) if best_error != float('inf') else 0.0
+            })
+        
+        # Convert back to parameter space
+        if self.use_symmetry:
+            approx_params = approx_lambda_full[:self.num_params]
+        else:
+            approx_params = approx_lambda_full
+        
+        # Evaluate objective with approximated values
+        original_obj = self.objective_function(lambda_params)
+        approx_obj = self.objective_function(approx_params)
+        
+        # Only return if approximation improves or maintains objective
+        if approx_obj <= original_obj * 1.1:  # Allow 10% degradation for nice closed forms
+            return {
+                'lambda_params': approx_params,
+                'lambda_full': approx_lambda_full,
+                'original_objective': float(original_obj),
+                'approximated_objective': float(approx_obj),
+                'improved': approx_obj < original_obj,
+                'approximations': approximations,
+                'num_approximated': sum(1 for a in approximations if a['form'] != "numerical")
+            }
+        else:
+            return None
+    
     def _convert_eq27_solution(self, eq27_lambda_full: np.ndarray) -> np.ndarray:
         """
         Convert Equation 27 solution to appropriate parameter vector for Equation 28.
@@ -582,8 +736,17 @@ class QFTEquation28Solver:
         print(f"Seed solution objective: {self.objective_function(seed_solution):.2e}")
         print(f"Warm-start objective: {nm_result.fun:.2e}")
         
-        # Now run DE with the improved solution as a reference
-        # DE will still do global search but we've provided good starting information
+        # Create initial population with the warm-start solution
+        # This seeds DE with a good solution while still allowing global exploration
+        init_population = np.random.uniform(
+            low=-bounds_multiplier*np.pi,
+            high=bounds_multiplier*np.pi,
+            size=(scaled_popsize, self.num_params)
+        )
+        # Replace first individual with the warm-start solution
+        init_population[0] = nm_result.x
+        
+        # Now run DE with the seeded initial population
         result = differential_evolution(
             func=self.objective_function,
             bounds=bounds,
@@ -592,23 +755,76 @@ class QFTEquation28Solver:
             disp=True,
             seed=42,
             atol=1e-12,
-            tol=1e-12
+            tol=1e-12,
+            init=init_population,
+            polish=False  # Disable automatic polishing, we'll do custom polishing
         )
         
-        solve_time = time.time() - start_time
-        lambda_full = self.expand_lambda_vector(result.x)
+        # Try rational pi approximation before final polishing
+        print("Attempting rational π approximation...")
+        rational_result = self._try_rational_pi_approximation(result.x, max_denominator=20, tolerance=1e-6)
         
-        return {
+        if rational_result is not None and rational_result['num_approximated'] > 0:
+            print(f"  ✓ Found {rational_result['num_approximated']} rational π approximations")
+            print(f"  Original objective: {rational_result['original_objective']:.2e}")
+            print(f"  Approximated objective: {rational_result['approximated_objective']:.2e}")
+            
+            # Show the approximations found
+            for approx in rational_result['approximations']:
+                if approx['form'] != "numerical":
+                    print(f"    λ_{approx['index']} ≈ {approx['form']} (error: {approx['error']:.2e})")
+            
+            # Use approximated values for final polishing
+            polish_start = rational_result['lambda_params']
+        else:
+            print("  No beneficial rational approximations found, using DE result")
+            polish_start = result.x
+        
+        # Final polishing with L-BFGS-B
+        print("Polishing solution with 'L-BFGS-B'")
+        polish_result = minimize(
+            fun=self.objective_function,
+            x0=polish_start,
+            method='L-BFGS-B',
+            bounds=bounds,
+            options={'ftol': 1e-12, 'gtol': 1e-12}
+        )
+        
+        print(f"  Objective: {polish_result.fun:.2e}, Success: {polish_result.success}")
+        
+        # Use polished result if it's better
+        if polish_result.fun < result.fun:
+            final_x = polish_result.x
+            final_obj = polish_result.fun
+            final_success = polish_result.success
+            print(f"  ★ Polishing improved solution!")
+        else:
+            final_x = result.x
+            final_obj = result.fun
+            final_success = result.success
+        
+        solve_time = time.time() - start_time
+        lambda_full = self.expand_lambda_vector(final_x)
+        
+        result_dict = {
             'method': 'Differential Evolution (Seeded)',
-            'lambda_params': result.x,
+            'lambda_params': final_x,
             'lambda_full': lambda_full,
-            'objective_value': result.fun,
-            'success': result.success,
+            'objective_value': final_obj,
+            'success': final_success,
             'iterations': result.nit,
             'solve_time': solve_time,
             'message': result.message,
             'seed_used': True
         }
+        
+        # Add rational approximation info if it was used
+        if rational_result is not None and rational_result['num_approximated'] > 0:
+            result_dict['rational_approximation_attempted'] = True
+            result_dict['rational_approximations'] = rational_result['approximations']
+            result_dict['num_rational_approximations'] = rational_result['num_approximated']
+        
+        return result_dict
     
     def get_standard_qft_phases(self) -> np.ndarray:
         """
@@ -621,27 +837,35 @@ class QFTEquation28Solver:
     
     def verify_solution(self, lambda_full: np.ndarray, 
                        tolerance: float = 1e-8,
-                       sample_ratio: float = 0.1) -> Dict:
+                       sample_ratio: float = 0.1,
+                       full_verification: bool = False) -> Dict:
         """
         Verify solution by checking residuals for sampled (m,n) pairs.
         
         Args:
             lambda_full: Full parameter vector
             tolerance: Numerical tolerance for verification
-            sample_ratio: Fraction of (m,n) pairs to check
+            sample_ratio: Fraction of (m,n) pairs to check (ignored if full_verification=True)
+            full_verification: If True, check ALL (m,n) pairs instead of sampling
             
         Returns:
             Verification results
         """
-        # Sample (m,n) pairs to check
+        # Determine which pairs to check
         total_pairs = self.N * self.N
-        n_sample = max(10, int(total_pairs * sample_ratio))
         
-        sampled_pairs = []
-        for _ in range(n_sample):
-            m = random.randint(0, self.N - 1)
-            n = random.randint(0, self.N - 1)
-            sampled_pairs.append((m, n))
+        if full_verification:
+            # Check ALL pairs
+            sampled_pairs = [(m, n) for m in range(self.N) for n in range(self.N)]
+            n_sample = total_pairs
+        else:
+            # Sample pairs
+            n_sample = max(10, int(total_pairs * sample_ratio))
+            sampled_pairs = []
+            for _ in range(n_sample):
+                m = random.randint(0, self.N - 1)
+                n = random.randint(0, self.N - 1)
+                sampled_pairs.append((m, n))
         
         max_residual = 0.0
         residuals = []
@@ -803,9 +1027,9 @@ Note: All methods can use Equation 27 solutions as intelligent initial guesses v
             result = solver.solve_multi_start(n_starts=args.random_starts, 
                                             eq27_solutions=eq27_solutions)
         
-        # Verify solution
-        print(f"\nVerifying solution...")
-        verification = solver.verify_solution(result['lambda_full'], args.tolerance)
+        # Verify solution with FULL verification (all N² pairs)
+        print(f"\nVerifying solution (checking all {solver.N}² = {solver.N**2} pairs)...")
+        verification = solver.verify_solution(result['lambda_full'], args.tolerance, full_verification=True)
         result['verification'] = verification
         
         # Print results
@@ -817,6 +1041,13 @@ Note: All methods can use Equation 27 solutions as intelligent initial guesses v
         print(f"Solution valid: {verification['is_valid']}")
         print(f"Max residual: {verification['max_residual']:.2e}")
         print(f"Mean residual: {verification['mean_residual']:.2e}")
+        
+        # Show rational approximations if found
+        if 'rational_approximation_attempted' in result and result['num_rational_approximations'] > 0:
+            print(f"\nRational π approximations found:")
+            for approx in result['rational_approximations']:
+                if approx['form'] != "numerical":
+                    print(f"  λ_{approx['index']} ≈ {approx['form']}")
         
         # Show some parameter values
         print(f"\nFirst few λ parameters:")
@@ -840,7 +1071,7 @@ Note: All methods can use Equation 27 solutions as intelligent initial guesses v
     print(f"\nStandard QFT Reference:")
     print("-" * 25)
     qft_phases = solver.get_standard_qft_phases()
-    qft_verification = solver.verify_solution(qft_phases, args.tolerance)
+    qft_verification = solver.verify_solution(qft_phases, args.tolerance, full_verification=True)
     print(f"Standard QFT satisfies equation: {qft_verification['is_valid']}")
     print(f"Standard QFT max residual: {qft_verification['max_residual']:.2e}")
     
@@ -884,6 +1115,12 @@ Note: All methods can use Equation 27 solutions as intelligent initial guesses v
         json_result['tolerance'] = float(args.tolerance)
         json_result['eq27_file'] = str(args.eq27_file) if args.eq27_file else None
         json_result['eq27_solutions_used'] = int(len(eq27_solutions)) if eq27_solutions else 0
+        
+        # Add rational approximation info if available
+        if 'rational_approximation_attempted' in result:
+            json_result['rational_approximation_attempted'] = True
+            json_result['num_rational_approximations'] = result['num_rational_approximations']
+            json_result['rational_approximations'] = result['rational_approximations']
         
         # Add standard QFT comparison
         json_result['standard_qft_lambda'] = qft_phases.tolist()

@@ -276,8 +276,10 @@ def convert_numpy_types(obj):
         return int(obj)
     elif isinstance(obj, np.floating):
         return float(obj)
-    elif isinstance(obj, np.complexfloating):
-        return complex(obj)
+    elif isinstance(obj, (np.complexfloating, complex)):
+        # Convert to native Python complex, which JSON will serialize as {"real": x, "imag": y}
+        c = complex(obj)
+        return {"real": c.real, "imag": c.imag}
     elif isinstance(obj, dict):
         return {key: convert_numpy_types(value) for key, value in obj.items()}
     elif isinstance(obj, list):
@@ -420,6 +422,344 @@ def load_lambda_values(filename: str, equation: Optional[int] = None) -> Tuple[i
     return N, lambda_k, metadata
 
 
+def try_rational_pi_approximation(lambda_k: np.ndarray, max_denominator: int = 20, 
+                                  tolerance: float = 1e-6) -> Tuple[np.ndarray, List[Dict]]:
+    """
+    Try to approximate lambda parameters as rational multiples of pi or sqrt(rational)*pi.
+    
+    Args:
+        lambda_k: Array of lambda values
+        max_denominator: Maximum denominator for rational approximation
+        tolerance: How close the approximation must be to original value
+        
+    Returns:
+        Tuple of (approximated_lambda_k, approximations_info)
+    """
+    from fractions import Fraction
+    import math
+    
+    approx_lambda_k = lambda_k.copy()
+    approximations = []
+    
+    for i, lam in enumerate(lambda_k):
+        best_approx = lam
+        best_form = None
+        best_error = float('inf')
+        
+        # Try rational multiples of pi: (p/q)*pi
+        ratio = lam / np.pi
+        try:
+            frac = Fraction(ratio).limit_denominator(max_denominator)
+            if abs(frac.numerator) < max_denominator and frac.denominator < max_denominator:
+                approx_val = float(frac) * np.pi
+                error = abs(approx_val - lam)
+                if error < tolerance and error < best_error:
+                    best_approx = approx_val
+                    if frac.denominator == 1:
+                        best_form = f"{frac.numerator}π" if frac.numerator != 1 else "π"
+                    else:
+                        best_form = f"{frac.numerator}π/{frac.denominator}"
+                    best_error = error
+        except (ValueError, ZeroDivisionError):
+            pass
+        
+        # Try sqrt(rational) * pi: sqrt(p/q)*pi
+        ratio_sq = (lam / np.pi) ** 2
+        if ratio_sq > 0:
+            try:
+                frac = Fraction(ratio_sq).limit_denominator(max_denominator)
+                if abs(frac.numerator) < max_denominator and frac.denominator < max_denominator:
+                    approx_val = math.sqrt(float(frac)) * np.pi
+                    error = abs(approx_val - lam)
+                    if error < tolerance and error < best_error:
+                        best_approx = approx_val
+                        if frac.denominator == 1:
+                            best_form = f"√{frac.numerator}π"
+                        else:
+                            best_form = f"√({frac.numerator}/{frac.denominator})π"
+                        best_error = error
+            except (ValueError, ZeroDivisionError):
+                pass
+        
+        # Try negative sqrt(rational) * pi
+        if lam < 0:
+            ratio_sq_neg = (lam / np.pi) ** 2
+            try:
+                frac = Fraction(ratio_sq_neg).limit_denominator(max_denominator)
+                if abs(frac.numerator) < max_denominator and frac.denominator < max_denominator:
+                    approx_val = -math.sqrt(float(frac)) * np.pi
+                    error = abs(approx_val - lam)
+                    if error < tolerance and error < best_error:
+                        best_approx = approx_val
+                        if frac.denominator == 1:
+                            best_form = f"-√{frac.numerator}π"
+                        else:
+                            best_form = f"-√({frac.numerator}/{frac.denominator})π"
+                        best_error = error
+            except (ValueError, ZeroDivisionError):
+                pass
+        
+        approx_lambda_k[i] = best_approx
+        approximations.append({
+            'index': i,
+            'original': float(lam),
+            'approximated': float(best_approx),
+            'form': best_form if best_form else f"{lam:.6f}",
+            'error': float(best_error) if best_error != float('inf') else 0.0,
+            'is_rational': best_form is not None
+        })
+    
+    return approx_lambda_k, approximations
+
+
+def complex_to_polar_string(c: complex, precision: int = 6) -> str:
+    """
+    Convert a complex number to polar notation string: rexp(itheta)
+    
+    Args:
+        c: Complex number
+        precision: Number of decimal places
+        
+    Returns:
+        String representation in polar form
+    """
+    r = abs(c)
+    theta = np.angle(c)
+    
+    # Handle special cases for cleaner output
+    if r < 1e-15:
+        return "0"
+    elif abs(theta) < 1e-15:  # Essentially real and positive
+        return f"{r:.{precision}f}"
+    elif abs(theta - np.pi) < 1e-15:  # Essentially real and negative
+        return f"{-r:.{precision}f}"
+    else:
+        return f"{r:.{precision}f}exp(i*{theta:.{precision}f})"
+
+
+def reconstruct_complex_array(data):
+    """
+    Reconstruct numpy array from JSON data that may contain complex numbers as dicts.
+    
+    Args:
+        data: List or nested list potentially containing {"real": x, "imag": y} dicts
+        
+    Returns:
+        Numpy array with proper complex dtype
+    """
+    def convert_item(item):
+        if isinstance(item, dict) and 'real' in item and 'imag' in item:
+            return complex(item['real'], item['imag'])
+        elif isinstance(item, list):
+            return [convert_item(x) for x in item]
+        else:
+            return item
+    
+    converted = convert_item(data)
+    return np.array(converted, dtype=complex)
+
+
+def generate_pdf_report(results: Dict[str, Any], approximations: List[Dict], 
+                        output_pdf: str, metadata: Dict[str, Any]):
+    """
+    Generate a beautiful PDF report with matrix visualizations.
+    
+    Args:
+        results: Results dictionary with all matrices
+        approximations: List of rational approximations
+        output_pdf: Output PDF filename
+        metadata: Metadata from source file
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_pdf import PdfPages
+    import matplotlib.patches as mpatches
+    
+    N = results['N']
+    
+    with PdfPages(output_pdf) as pdf:
+        # Page 1: Title and Lambda Values
+        fig = plt.figure(figsize=(11, 8.5))
+        fig.suptitle(f'QFT Matrix Construction Report (N={N})', fontsize=20, fontweight='bold')
+        
+        ax = fig.add_subplot(111)
+        ax.axis('off')
+        
+        # Lambda values section
+        y_pos = 0.85
+        ax.text(0.5, y_pos, 'Phase Parameters λₖ', ha='center', fontsize=16, fontweight='bold')
+        y_pos -= 0.08
+        
+        for approx in approximations:
+            i = approx['index']
+            if approx['is_rational']:
+                text = f"λ_{i} = {approx['form']}"
+                if approx['error'] > 0:
+                    text += f"  (error: {approx['error']:.2e})"
+                color = 'green'
+            else:
+                text = f"λ_{i} = {approx['original']:.6f}"
+                color = 'black'
+            
+            ax.text(0.5, y_pos, text, ha='center', fontsize=12, color=color, family='monospace')
+            y_pos -= 0.05
+        
+        # Verification info
+        y_pos -= 0.05
+        ax.text(0.5, y_pos, 'Verification Results', ha='center', fontsize=16, fontweight='bold')
+        y_pos -= 0.08
+        
+        verif = results['verification']
+        is_valid = verif['qft_correctness']['is_correct_qft']
+        status_color = 'green' if is_valid else 'red'
+        status_text = '✓ VALID QFT' if is_valid else '✗ NOT VALID QFT'
+        
+        ax.text(0.5, y_pos, status_text, ha='center', fontsize=14, 
+               color=status_color, fontweight='bold')
+        y_pos -= 0.05
+        
+        ax.text(0.5, y_pos, f"Max difference from standard QFT: {verif['qft_correctness']['max_difference']:.2e}", 
+               ha='center', fontsize=11, family='monospace')
+        y_pos -= 0.04
+        
+        ax.text(0.5, y_pos, f"U matrix unitarity deviation: {verif['U_unitarity']['max_deviation']:.2e}", 
+               ha='center', fontsize=11, family='monospace')
+        y_pos -= 0.04
+        
+        ax.text(0.5, y_pos, f"D matrix unitarity deviation: {verif['D_unitarity']['max_deviation']:.2e}", 
+               ha='center', fontsize=11, family='monospace')
+        
+        # Metadata
+        if metadata:
+            y_pos -= 0.08
+            ax.text(0.5, y_pos, 'Source Information', ha='center', fontsize=14, fontweight='bold')
+            y_pos -= 0.05
+            
+            if 'source_equation' in metadata:
+                ax.text(0.5, y_pos, f"Equation: {metadata['source_equation']}", 
+                       ha='center', fontsize=10, family='monospace')
+                y_pos -= 0.03
+            
+            if 'objective_value' in metadata and metadata['objective_value'] is not None:
+                ax.text(0.5, y_pos, f"Objective value: {metadata['objective_value']:.2e}", 
+                       ha='center', fontsize=10, family='monospace')
+        
+        pdf.savefig(fig, bbox_inches='tight')
+        plt.close()
+        
+        # Page 2-N: Matrix visualizations
+        matrices_to_plot = [
+            ('U^(N) Matrix', 'U_matrix', 'Phase magnitude matrix'),
+            ('u Coefficients', 'u_coefficients', 'Scaled coefficients'),
+            ('D^(N) QFT Matrix', 'D_qft_matrix', 'Final QFT matrix'),
+            ('Standard QFT', 'standard_qft', 'Reference QFT matrix')
+        ]
+        
+        for title, key, subtitle in matrices_to_plot:
+            # Reconstruct complex array from JSON data
+            matrix = reconstruct_complex_array(results['matrices'][key])
+            
+            fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+            fig.suptitle(f'{title} - {subtitle}', fontsize=14, fontweight='bold')
+            
+            # Magnitude plot
+            mag = np.abs(matrix)
+            im1 = axes[0].imshow(mag, cmap='viridis', aspect='auto')
+            axes[0].set_title('Magnitude |M_{i,j}|')
+            axes[0].set_xlabel('Column j')
+            axes[0].set_ylabel('Row i')
+            plt.colorbar(im1, ax=axes[0])
+            
+            # Add text annotations for small matrices (magnitude only)
+            if N <= 7:
+                for i in range(N):
+                    for j in range(N):
+                        text = axes[0].text(j, i, f'{mag[i, j]:.3f}',
+                                          ha="center", va="center", color="w", fontsize=8)
+            
+            # Phase plot
+            phase = np.angle(matrix)
+            im2 = axes[1].imshow(phase, cmap='twilight', aspect='auto', vmin=-np.pi, vmax=np.pi)
+            axes[1].set_title('Phase arg(M_{i,j})')
+            axes[1].set_xlabel('Column j')
+            axes[1].set_ylabel('Row i')
+            cbar2 = plt.colorbar(im2, ax=axes[1])
+            cbar2.set_ticks([-np.pi, -np.pi/2, 0, np.pi/2, np.pi])
+            cbar2.set_ticklabels(['-π', '-π/2', '0', 'π/2', 'π'])
+            
+            plt.tight_layout()
+            pdf.savefig(fig, bbox_inches='tight')
+            plt.close()
+            
+            # Add polar notation page for small matrices
+            if N <= 5:
+                fig = plt.figure(figsize=(11, 8.5))
+                fig.suptitle(f'{title} - Polar Notation: rexp(iθ)', fontsize=14, fontweight='bold')
+                ax = fig.add_subplot(111)
+                ax.axis('off')
+                
+                # Create table with polar notation
+                y_start = 0.9
+                line_height = 0.8 / (N + 1)
+                
+                # Header
+                ax.text(0.1, y_start, 'i\\j', ha='center', fontsize=10, fontweight='bold')
+                for j in range(N):
+                    ax.text(0.2 + j * 0.7 / N, y_start, f'{j}', ha='center', fontsize=10, fontweight='bold')
+                
+                # Matrix values in polar form
+                for i in range(N):
+                    y_pos = y_start - (i + 1) * line_height
+                    ax.text(0.1, y_pos, f'{i}', ha='center', fontsize=9, fontweight='bold')
+                    for j in range(N):
+                        polar_str = complex_to_polar_string(matrix[i, j], precision=4)
+                        ax.text(0.2 + j * 0.7 / N, y_pos, polar_str, 
+                               ha='center', fontsize=7, family='monospace')
+                
+                pdf.savefig(fig, bbox_inches='tight')
+                plt.close()
+        
+        # Final page: Matrix comparison (D vs Standard QFT)
+        D = reconstruct_complex_array(results['matrices']['D_qft_matrix'])
+        QFT_std = reconstruct_complex_array(results['matrices']['standard_qft'])
+        difference = D - QFT_std
+        
+        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+        fig.suptitle('QFT Comparison: Generated D^(N) vs Standard QFT', fontsize=14, fontweight='bold')
+        
+        # D magnitude
+        im1 = axes[0, 0].imshow(np.abs(D), cmap='viridis', aspect='auto')
+        axes[0, 0].set_title('|D^(N)|')
+        plt.colorbar(im1, ax=axes[0, 0])
+        
+        # Standard QFT magnitude
+        im2 = axes[0, 1].imshow(np.abs(QFT_std), cmap='viridis', aspect='auto')
+        axes[0, 1].set_title('|QFT_{standard}|')
+        plt.colorbar(im2, ax=axes[0, 1])
+        
+        # Magnitude difference
+        im3 = axes[1, 0].imshow(np.abs(difference), cmap='hot', aspect='auto')
+        axes[1, 0].set_title('|D^(N) - QFT_{standard}|')
+        plt.colorbar(im3, ax=axes[1, 0])
+        
+        # Phase difference
+        phase_diff = np.angle(difference)
+        im4 = axes[1, 1].imshow(phase_diff, cmap='twilight', aspect='auto', vmin=-np.pi, vmax=np.pi)
+        axes[1, 1].set_title('arg(D^(N) - QFT_{standard})')
+        cbar4 = plt.colorbar(im4, ax=axes[1, 1])
+        cbar4.set_ticks([-np.pi, 0, np.pi])
+        cbar4.set_ticklabels(['-π', '0', 'π'])
+        
+        for ax in axes.flat:
+            ax.set_xlabel('Column')
+            ax.set_ylabel('Row')
+        
+        plt.tight_layout()
+        pdf.savefig(fig, bbox_inches='tight')
+        plt.close()
+    
+    print(f"\n📊 PDF report generated: {output_pdf}")
+
+
 def main():
     """Main function."""
     parser = argparse.ArgumentParser(
@@ -452,6 +792,8 @@ The output JSON file contains:
                        help='Equation type (27 or 28). Auto-detected if not specified.')
     parser.add_argument('--tolerance', '-t', type=float, default=1e-10,
                        help='Tolerance for numerical verifications (default: 1e-10)')
+    parser.add_argument('--pdf', '-p', type=str,
+                       help='Generate a PDF report with matrix visualizations and rational π approximations')
     parser.add_argument('--verbose', '-v', action='store_true',
                        help='Verbose output')
     
@@ -461,8 +803,32 @@ The output JSON file contains:
         # Load lambda values
         N, lambda_k, metadata = load_lambda_values(args.input_file, args.equation)
         
+        # Try rational pi approximation if PDF is requested
+        if args.pdf:
+            print("\nAttempting rational π approximations for PDF...")
+            approx_lambda_k, approximations = try_rational_pi_approximation(
+                lambda_k, max_denominator=20, tolerance=1e-6
+            )
+            num_rational = sum(1 for a in approximations if a['is_rational'])
+            if num_rational > 0:
+                print(f"  ✓ Found {num_rational} rational π approximations")
+                for approx in approximations:
+                    if approx['is_rational']:
+                        print(f"    λ_{approx['index']} ≈ {approx['form']} (error: {approx['error']:.2e})")
+                # Use approximated values for matrix generation
+                lambda_k_for_matrices = approx_lambda_k
+            else:
+                print("  No rational approximations found, using original values")
+                lambda_k_for_matrices = lambda_k
+                approximations = [{'index': i, 'original': float(lam), 'approximated': float(lam), 
+                                 'form': f"{lam:.6f}", 'error': 0.0, 'is_rational': False} 
+                                for i, lam in enumerate(lambda_k)]
+        else:
+            lambda_k_for_matrices = lambda_k
+            approximations = None
+        
         # Create generator
-        generator = QFTMatrixGenerator(N, lambda_k)
+        generator = QFTMatrixGenerator(N, lambda_k_for_matrices)
         
         # Generate matrices
         results = generator.generate_all_matrices(tolerance=args.tolerance)
@@ -475,6 +841,11 @@ The output JSON file contains:
             'equation_type': metadata.get('source_equation', 'unknown')
         }
         
+        # Add approximation info if PDF was generated
+        if args.pdf and approximations:
+            results['rational_approximations'] = approximations
+            results['num_rational_approximations'] = sum(1 for a in approximations if a['is_rational'])
+        
         # Convert numpy types for JSON serialization
         results = convert_numpy_types(results)
         
@@ -483,6 +854,10 @@ The output JSON file contains:
             json.dump(results, f, indent=2)
         
         print(f"\nMatrices saved to: {args.output}")
+        
+        # Generate PDF if requested
+        if args.pdf:
+            generate_pdf_report(results, approximations, args.pdf, metadata)
         
         # Print summary
         print(f"\nSUMMARY:")
