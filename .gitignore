@@ -11,3 +11,9 @@ __pycache__/
 # PDF files
 *.pdf
 */*.pdf
+
+# Jupyter notebooks
+*.ipynb
+
+# Backup files
+BACKUP*
